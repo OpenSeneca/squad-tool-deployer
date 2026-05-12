@@ -1,511 +1,305 @@
 #!/usr/bin/env python3
 """
-Squad Tool Deployer - Manage and deploy tools across all squad agents
+Squad Tool Deployer
+Manages tool deployment across all squad agents.
 
-This tool helps with:
-- Deploying tools to all squad agents
-- Checking which tools are installed on which agents
-- Keeping tools in sync across agents
-- Running validation on all agents
-- Rolling out updates
+Features:
+- Agent discovery
+- Tool deployment to single/all agents
+- Installation checks
+- Sync core tools
+- Run validation
+- Inventory
 
-Usage:
-    python3 main.py --list-agents
-    python3 main.py --deploy squad-config-validator --all-agents
-    python3 main.py --check-tool squad-config-validator --all-agents
-    python3 main.py --sync-tools --all-agents
+Uses rsync for remote, cp for local.
 """
 
 import argparse
+import json
+import os
 import subprocess
 import sys
-import os
+from datetime import datetime
 from pathlib import Path
-import json
-import re
-from typing import List, Dict, Optional, Tuple
 
-# Base workspace directory
-WORKSPACE_DIR = Path.home() / ".openclaw" / "workspace" / "tools"
-
-# Squad agent configuration
-SQUAD_AGENTS = {
-    "seneca": {
-        "host": "100.101.15.68",
-        "user": "exedev",
-        "role": "Squad Leader"
-    },
-    "marcus": {
-        "host": "100.98.223.103",
-        "user": "exedev",
-        "role": "Research - AI/ML"
-    },
-    "galen": {
-        "host": "100.123.121.125",
-        "user": "exedev",
-        "role": "Research - Biopharma"
-    },
-    "archimedes": {
-        "host": "100.100.56.102",
-        "user": "exedev",
-        "role": "Engineering (local)"
-    },
-    "argus": {
-        "host": "100.108.219.91",
-        "user": "exedev",
-        "role": "Monitoring"
-    },
-    "clutch": {
-        "host": "100.93.69.117",
-        "user": "exedev",
-        "role": "Operations"
-    },
+# Squad agents configuration (using Tailscale IPs)
+AGENTS = {
+    "marcus": {"host": "100.98.223.103", "user": "exedev", "type": "ssh"},
+    "seneca": {"host": "100.101.15.68", "user": "exedev", "type": "ssh"},
+    "galen": {"host": "100.123.121.125", "user": "exedev", "type": "ssh"},
+    "argus": {"host": "100.108.219.91", "user": "exedev", "type": "ssh"},
+    "clutch": {"host": "100.87.144.118", "user": "exedev", "type": "ssh"},
+    "archimedes": {"host": "localhost", "user": "exedev", "type": "local"},
 }
 
-# Core tools that should be installed on all agents
+# Core tools to sync
 CORE_TOOLS = [
     "squad-config-validator",
     "squad-config-monitor",
     "auto-ingester",
 ]
 
+# Workspace paths
+WORKSPACE = Path.home() / ".openclaw" / "workspace"
+TOOLS_DIR = WORKSPACE / "tools"
+LOG_DIR = WORKSPACE / "logs"
 
-class SquadToolDeployer:
-    def __init__(self, verbose: bool = False):
-        self.verbose = verbose
-        self.workspace_dir = WORKSPACE_DIR
 
-    def log(self, message: str):
-        """Print log message if verbose."""
-        if self.verbose:
-            print(f"[INFO] {message}", file=sys.stderr)
+def run_command(cmd, capture=True, timeout=10):
+    """Run a shell command with timeout."""
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=capture,
+            text=True,
+            timeout=timeout,
+        )
+        if capture:
+            return result.stdout, result.returncode
+        return None, result.returncode
+    except subprocess.TimeoutExpired:
+        if capture:
+            return None, 1
+        return None, 1
+    except Exception as e:
+        if capture:
+            return str(e), 1
+        return None, 1
 
-    def run_ssh_command(self, agent: str, command: List[str], timeout: int = 30) -> Tuple[int, str, str]:
-        """Run a command on a remote agent via SSH."""
-        agent_config = SQUAD_AGENTS.get(agent)
-        if not agent_config:
-            return 1, "", f"Unknown agent: {agent}"
 
-        # For local agent, run directly
-        if agent == "archimedes":
-            self.log(f"Running local: {' '.join(command)}")
-            try:
-                result = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout
-                )
-                return result.returncode, result.stdout, result.stderr
-            except subprocess.TimeoutExpired:
-                return 1, "", f"Command timed out after {timeout}s"
+def check_ssh_agent(agent_name, agent_config):
+    """Check if SSH agent is reachable."""
+    if agent_config["type"] == "local":
+        return True, "Local agent"
 
-        # For remote agents, use SSH
-        ssh_cmd = [
-            "ssh",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "StrictHostKeyChecking=no",
-            f"{agent_config['user']}@{agent_config['host']}",
-            " ".join(command)
-        ]
+    host = agent_config["host"]
+    user = agent_config["user"]
 
-        self.log(f"Running SSH on {agent}: {' '.join(command)}")
+    # Check ping
+    stdout, _ = run_command(f"ping -c 1 -W 2 {host} 2>/dev/null", timeout=5)
+    if stdout is None:
+        return False, "SSH connection failed (timeout)"
 
-        try:
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            return result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            return 1, "", f"SSH connection timed out after {timeout}s"
+    # Check SSH connectivity
+    stdout, returncode = run_command(
+        f"ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no {user}@{host} 'echo ok'",
+        timeout=10
+    )
 
-    def list_agents(self) -> List[Dict[str, str]]:
-        """List all squad agents with their status."""
-        agents = []
-        for agent_name, agent_config in SQUAD_AGENTS.items():
-            # Check if agent is reachable
-            code, stdout, stderr = self.run_ssh_command(agent_name, ["echo", "OK"], timeout=10)
+    if returncode == 0:
+        return True, "SSH connection OK"
+    else:
+        return False, f"SSH connection failed (code {returncode})"
 
-            agent_info = {
-                "name": agent_name,
-                "host": agent_config["host"],
-                "role": agent_config["role"],
-                "status": "UP" if code == 0 and stdout.strip() == "OK" else "DOWN"
-            }
 
-            if code != 0:
-                agent_info["error"] = stderr.strip() or stdout.strip()
+def list_agents():
+    """List all squad agents with their status."""
+    print("=" * 60)
+    print("Squad Agent Status")
+    print("=" * 60)
+    print(f"{'Agent':<12} {'Host':<15} {'Type':<8} {'Status':<20}")
+    print("-" * 60)
 
-            agents.append(agent_info)
+    for agent_name, config in AGENTS.items():
+        status_ok, status_msg = check_ssh_agent(agent_name, config)
+        status_icon = "✓" if status_ok else "✗"
+        print(f"{agent_name:<12} {config['host']:<15} {config['type']:<8} {status_icon} {status_msg:<18}")
 
-        return agents
+    print("=" * 60)
 
-    def check_tool_installed(self, agent: str, tool_name: str) -> Dict[str, any]:
-        """Check if a tool is installed on an agent."""
-        # Check if tool directory exists
-        cmd = ["ls", "-d", str(self.workspace_dir / tool_name)]
-        code, stdout, stderr = self.run_ssh_command(agent, cmd)
 
-        tool_dir_exists = code == 0
+def deploy_tool(tool_name, agent_name=None, dry_run=False):
+    """Deploy a tool to one or all agents."""
+    tool_path = TOOLS_DIR / tool_name
 
-        # Check if tool has setup.py
-        setup_exists = False
-        version = None
+    if not tool_path.exists():
+        print(f"✗ Tool not found: {tool_name}")
+        return False
 
-        if tool_dir_exists:
-            setup_cmd = ["test", "-f", str(self.workspace_dir / tool_name / "setup.py")]
-            setup_code, _, _ = self.run_ssh_command(agent, setup_cmd)
-            setup_exists = setup_code == 0
+    targets = [agent_name] if agent_name else AGENTS.keys()
 
-            # Try to get version
-            if setup_exists:
-                version_cmd = ["grep", "-oP", '(?<=version=")[^"]+',
-                              str(self.workspace_dir / tool_name / "setup.py")]
-                v_code, v_stdout, _ = self.run_ssh_command(agent, version_cmd)
-                if v_code == 0:
-                    version = v_stdout.strip()
+    for target in targets:
+        if target not in AGENTS:
+            print(f"✗ Unknown agent: {target}")
+            continue
 
-        return {
-            "agent": agent,
-            "tool": tool_name,
-            "installed": tool_dir_exists,
-            "has_setup": setup_exists,
-            "version": version
-        }
+        agent_config = AGENTS[target]
 
-    def deploy_tool(self, agent: str, tool_name: str, source_path: Optional[Path] = None) -> bool:
-        """Deploy a tool to an agent."""
-        # Find tool source
-        if source_path is None:
-            source_path = self.workspace_dir / tool_name
+        if dry_run:
+            print(f"[DRY RUN] Would deploy {tool_name} to {target}")
+            continue
 
-        if not source_path.exists():
-            print(f"Error: Tool source not found at {source_path}", file=sys.stderr)
-            return False
+        print(f"Deploying {tool_name} to {target}...")
 
-        # Create target directory on agent
-        target_dir = self.workspace_dir / tool_name
-
-        print(f"Deploying {tool_name} to {agent}...")
-
-        # Create target directory
-        mkdir_cmd = ["mkdir", "-p", str(target_dir)]
-        code, _, stderr = self.run_ssh_command(agent, mkdir_cmd)
-        if code != 0:
-            print(f"Error creating directory: {stderr}", file=sys.stderr)
-            return False
-
-        # Use rsync to copy files (for remote) or cp (for local)
-        if agent == "archimedes":
-            # Local copy - just verify it's already there
-            if source_path == target_dir:
-                print(f"✓ {tool_name} is already at target location")
-                return True
-
-            # Copy files
-            cp_cmd = ["cp", "-r", f"{source_path}/.", str(target_dir)]
-            code, _, stderr = self.run_ssh_command(agent, cp_cmd)
-            if code != 0:
-                print(f"Error copying files: {stderr}", file=sys.stderr)
-                return False
+        if agent_config["type"] == "local":
+            # Use cp for local
+            target_dir = WORKSPACE / "tools" / tool_name
+            stdout, returncode = run_command(f"cp -r {tool_path} {target_dir}")
+            if returncode == 0:
+                print(f"  ✓ Deployed to local {target_dir}")
+            else:
+                print(f"  ✗ Failed: {stdout}")
         else:
-            # Remote copy using rsync
-            agent_config = SQUAD_AGENTS[agent]
-            rsync_cmd = [
-                "rsync", "-avz", "--delete",
-                "-e", "ssh -o BatchMode=yes -o StrictHostKeyChecking=no",
-                f"{source_path}/",
-                f"{agent_config['user']}@{agent_config['host']}:{target_dir}/"
-            ]
+            # Use rsync for remote
+            host = agent_config["host"]
+            user = agent_config["user"]
+            remote_tools_dir = f"{user}@{host}:.openclaw/workspace/tools"
 
-            self.log(f"Running: {' '.join(rsync_cmd)}")
+            stdout, returncode = run_command(
+                f"rsync -avz --delete {tool_path}/ {remote_tools_dir}/{tool_name}/",
+                timeout=30
+            )
+            if returncode == 0:
+                print(f"  ✓ Deployed to {host}")
+            else:
+                print(f"  ✗ Failed: {stdout}")
 
-            try:
-                result = subprocess.run(
-                    rsync_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=120
-                )
+    return True
 
-                if result.returncode != 0:
-                    print(f"Error copying files: {result.stderr}", file=sys.stderr)
-                    return False
-            except subprocess.TimeoutExpired:
-                print(f"Error: rsync timed out", file=sys.stderr)
-                return False
 
-        print(f"✓ Successfully deployed {tool_name} to {agent}")
-        return True
+def check_installation(agent_name, tool_name):
+    """Check if a tool is installed on an agent."""
+    agent_config = AGENTS[agent_name]
 
-    def sync_core_tools(self, agents: List[str]) -> Dict[str, List[str]]:
-        """Sync core tools to specified agents."""
-        results = {
-            "success": [],
-            "failed": []
-        }
+    if agent_config["type"] == "local":
+        tool_path = TOOLS_DIR / tool_name / "main.py"
+        if tool_path.exists():
+            return True, "Installed"
+        return False, "Not found"
+
+    host = agent_config["host"]
+    user = agent_config["user"]
+
+    stdout, returncode = run_command(
+        f"ssh {user}@{host} 'test -f .openclaw/workspace/tools/{tool_name}/main.py && echo found'",
+        timeout=10
+    )
+
+    if stdout and "found" in stdout:
+        return True, "Installed"
+    return False, "Not found"
+
+
+def inventory(agent_name=None):
+    """Show inventory of tools on one or all agents."""
+    targets = [agent_name] if agent_name else AGENTS.keys()
+
+    print("=" * 60)
+    print("Tool Inventory")
+    print("=" * 60)
+
+    for target in targets:
+        if target not in AGENTS:
+            continue
+
+        print(f"\n{target}:")
+        print(f"  {'Tool':<30} {'Status':<10}")
+        print("  " + "-" * 40)
 
         for tool_name in CORE_TOOLS:
-            tool_path = self.workspace_dir / tool_name
+            installed, status = check_installation(target, tool_name)
+            icon = "✓" if installed else "✗"
+            print(f"  {icon} {tool_name:<29} {status:<10}")
 
-            if not tool_path.exists():
-                print(f"Warning: Tool {tool_name} not found locally, skipping", file=sys.stderr)
-                continue
+    print("=" * 60)
 
-            for agent in agents:
-                if self.deploy_tool(agent, tool_name):
-                    results["success"].append(f"{agent}:{tool_name}")
-                else:
-                    results["failed"].append(f"{agent}:{tool_name}")
 
-        return results
+def validate_agent(agent_name):
+    """Run validation checks on an agent."""
+    print(f"\nValidating {agent_name}...")
 
-    def run_validation(self, agents: List[str]) -> Dict[str, any]:
-        """Run squad-config-validator on specified agents."""
-        results = {}
+    status_ok, status_msg = check_ssh_agent(agent_name, AGENTS[agent_name])
+    print(f"  Connection: {status_msg}")
+    if not status_ok:
+        return False
 
-        for agent in agents:
-            validator_path = self.workspace_dir / "squad-config-validator" / "main.py"
+    all_installed = True
+    for tool_name in CORE_TOOLS:
+        installed, status = check_installation(agent_name, tool_name)
+        print(f"  {tool_name}: {status}")
+        if not installed:
+            all_installed = False
 
-            if agent == "archimedes":
-                # Run locally
-                cmd = [sys.executable, str(validator_path), "--local", "--output", "json"]
-            else:
-                # Run remotely
-                cmd = [sys.executable, str(validator_path), "--local", "--output", "json"]
+    return all_installed
 
-            code, stdout, stderr = self.run_ssh_command(agent, cmd, timeout=60)
 
-            results[agent] = {
-                "success": code == 0,
-                "output": stdout,
-                "error": stderr if code != 0 else None
-            }
+def sync_tools(agent_name=None, all_agents=False, dry_run=False):
+    """Sync core tools to agents."""
+    targets = []
 
-        return results
+    if all_agents:
+        targets = list(AGENTS.keys())
+    elif agent_name:
+        targets = [agent_name]
+    else:
+        print("Error: Specify --agent or --all-agents")
+        return False
+
+    print("=" * 60)
+    print("Syncing Core Tools")
+    print("=" * 60)
+    print(f"Tools: {', '.join(CORE_TOOLS)}")
+    print(f"Targets: {', '.join(targets)}")
+    print("=" * 60)
+
+    # Deploy each tool to each target
+    for target in targets:
+        for tool_name in CORE_TOOLS:
+            print(f"\n{tool_name} -> {target}:")
+            deploy_tool(tool_name, target, dry_run=dry_run)
+
+    print("=" * 60)
+    print("Sync complete")
+    print("=" * 60)
+
+    return True
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Squad Tool Deployer - Manage tools across squad agents",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # List all agents and their status
-  python3 main.py --list-agents
+    parser = argparse.ArgumentParser(description="Squad Tool Deployer")
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-  # Check if a tool is installed on an agent
-  python3 main.py --check-tool squad-config-validator --agent seneca
+    # List agents
+    subparsers.add_parser("list-agents", help="List all squad agents")
 
-  # Deploy a tool to an agent
-  python3 main.py --deploy squad-config-validator --agent seneca
+    # Deploy tool
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy a tool")
+    deploy_parser.add_argument("tool", help="Tool name to deploy")
+    deploy_parser.add_argument("--agent", help="Target agent (default: all)")
+    deploy_parser.add_argument("--dry-run", action="store_true", help="Dry run")
 
-  # Deploy to all agents
-  python3 main.py --deploy squad-config-validator --all-agents
+    # Sync tools
+    sync_parser = subparsers.add_parser("sync-tools", help="Sync core tools")
+    sync_parser.add_argument("--agent", help="Target agent")
+    sync_parser.add_argument("--all-agents", action="store_true", help="Sync to all agents")
+    sync_parser.add_argument("--dry-run", action="store_true", help="Dry run")
 
-  # Sync all core tools to all agents
-  python3 main.py --sync-tools --all-agents
+    # Inventory
+    inv_parser = subparsers.add_parser("inventory", help="Show tool inventory")
+    inv_parser.add_argument("--agent", help="Target agent (default: all)")
 
-  # Run validation on all agents
-  python3 main.py --validate --all-agents
-
-  # Show what tools are installed where
-  python3 main.py --inventory
-        """
-    )
-
-    parser.add_argument(
-        "--list-agents",
-        action="store_true",
-        help="List all squad agents with their status"
-    )
-
-    parser.add_argument(
-        "--agent", "-a",
-        help="Target agent (one of: seneca, marcus, galen, archimedes, argus, clutch)"
-    )
-
-    parser.add_argument(
-        "--all-agents",
-        action="store_true",
-        help="Target all agents"
-    )
-
-    parser.add_argument(
-        "--check-tool", "-c",
-        help="Check if a tool is installed on target agent(s)"
-    )
-
-    parser.add_argument(
-        "--deploy", "-d",
-        help="Deploy a tool to target agent(s)"
-    )
-
-    parser.add_argument(
-        "--sync-tools",
-        action="store_true",
-        help="Sync all core tools to target agent(s)"
-    )
-
-    parser.add_argument(
-        "--validate",
-        action="store_true",
-        help="Run squad-config-validator on target agent(s)"
-    )
-
-    parser.add_argument(
-        "--inventory",
-        action="store_true",
-        help="Show tool inventory across all agents"
-    )
-
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Verbose output"
-    )
+    # Validate
+    val_parser = subparsers.add_parser("validate", help="Validate agent setup")
+    val_parser.add_argument("agent", help="Agent to validate")
 
     args = parser.parse_args()
 
-    deployer = SquadToolDeployer(verbose=args.verbose)
+    if not args.command:
+        parser.print_help()
+        return
 
-    # List agents
-    if args.list_agents:
-        agents = deployer.list_agents()
-        print("\n" + "=" * 80)
-        print("Squad Agents Status")
-        print("=" * 80)
-
-        for agent in agents:
-            status_symbol = "✅" if agent["status"] == "UP" else "❌"
-            print(f"\n{status_symbol} {agent['name']}")
-            print(f"   Role: {agent['role']}")
-            print(f"   Host: {agent['host']}")
-            print(f"   Status: {agent['status']}")
-            if "error" in agent:
-                print(f"   Error: {agent['error']}")
-
-        print("\n" + "=" * 80)
-        return 0
-
-    # Get target agents
-    target_agents = []
-    if args.all_agents:
-        target_agents = list(SQUAD_AGENTS.keys())
-    elif args.agent:
-        if args.agent not in SQUAD_AGENTS:
-            print(f"Error: Unknown agent {args.agent}", file=sys.stderr)
-            print(f"Valid agents: {', '.join(SQUAD_AGENTS.keys())}", file=sys.stderr)
-            return 1
-        target_agents = [args.agent]
-    else:
-        print("Error: Specify --agent or --all-agents", file=sys.stderr)
-        return 1
-
-    # Check tool
-    if args.check_tool:
-        print(f"\nChecking {args.check_tool} on {len(target_agents)} agent(s)...\n")
-
-        for agent in target_agents:
-            result = deployer.check_tool_installed(agent, args.check_tool)
-            status = "✅ Installed" if result["installed"] else "❌ Not installed"
-
-            print(f"{agent}:")
-            print(f"  Status: {status}")
-            if result["installed"]:
-                if result["has_setup"]:
-                    print(f"  Setup: ✅ Has setup.py")
-                    if result["version"]:
-                        print(f"  Version: {result['version']}")
-                else:
-                    print(f"  Setup: ⚠️  No setup.py")
-
-        return 0
-
-    # Deploy tool
-    if args.deploy:
-        print(f"\nDeploying {args.deploy} to {len(target_agents)} agent(s)...\n")
-
-        success_count = 0
-        for agent in target_agents:
-            if deployer.deploy_tool(agent, args.deploy):
-                success_count += 1
-
-        print(f"\nDeployment complete: {success_count}/{len(target_agents)} agents successful")
-        return 0 if success_count == len(target_agents) else 1
-
-    # Sync core tools
-    if args.sync_tools:
-        print(f"\nSyncing core tools to {len(target_agents)} agent(s)...\n")
-        print(f"Core tools: {', '.join(CORE_TOOLS)}\n")
-
-        results = deployer.sync_core_tools(target_agents)
-
-        print(f"\nSync complete:")
-        print(f"  Success: {len(results['success'])}")
-        print(f"  Failed: {len(results['failed'])}")
-
-        if results['failed']:
-            print(f"\nFailed deployments:")
-            for item in results['failed']:
-                print(f"  ❌ {item}")
-
-        return 0 if not results['failed'] else 1
-
-    # Run validation
-    if args.validate:
-        print(f"\nRunning validation on {len(target_agents)} agent(s)...\n")
-
-        results = deployer.run_validation(target_agents)
-
-        for agent, result in results.items():
-            status = "✅ PASS" if result["success"] else "❌ FAIL"
-            print(f"{agent}: {status}")
-
-            if not result["success"] and result["error"]:
-                print(f"  Error: {result['error'][:200]}")
-
-        return 0
-
-    # Inventory
-    if args.inventory:
-        print("\n" + "=" * 80)
-        print("Tool Inventory Across Squad")
-        print("=" * 80)
-
-        # Get list of all tools locally
-        local_tools = []
-        if deployer.workspace_dir.exists():
-            for item in deployer.workspace_dir.iterdir():
-                if item.is_dir() and not item.name.startswith("_"):
-                    local_tools.append(item.name)
-
-        print(f"\nLocal tools: {len(local_tools)}")
-        for tool in sorted(local_tools):
-            print(f"  - {tool}")
-
-        print(f"\nChecking installation on agents...\n")
-
-        for agent in target_agents:
-            print(f"{agent}:")
-            for tool in sorted(local_tools)[:5]:  # Limit to 5 for brevity
-                result = deployer.check_tool_installed(agent, tool)
-                status = "✅" if result["installed"] else "❌"
-                print(f"  {status} {tool}")
-            if len(local_tools) > 5:
-                print(f"  ... and {len(local_tools) - 5} more")
-
-        print("\n" + "=" * 80)
-        return 0
-
-    # If no action specified, show help
-    parser.print_help()
-    return 1
+    if args.command == "list-agents":
+        list_agents()
+    elif args.command == "deploy":
+        deploy_tool(args.tool, args.agent, args.dry_run)
+    elif args.command == "sync-tools":
+        sync_tools(args.agent, args.all_agents, args.dry_run)
+    elif args.command == "inventory":
+        inventory(args.agent)
+    elif args.command == "validate":
+        validate_agent(args.agent)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
